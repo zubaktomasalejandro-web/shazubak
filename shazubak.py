@@ -1,16 +1,18 @@
 import os
 import re
 import json
-import glob
 import asyncio
 import subprocess
 import sys
+import ssl
 import shutil
+from tempfile import TemporaryDirectory
+from urllib.parse import urlsplit
 
 from pathlib import Path
+import certifi
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
-from shazamio import Shazam
 
 
 def get_app_directory():
@@ -23,24 +25,38 @@ def get_app_directory():
 APP_DIR = get_app_directory()
 
 PROGRAM_FILES_DIR = APP_DIR / "program files"
-TRACKLISTS_DIR = APP_DIR / "tracklists"
-TEMP_DIR = APP_DIR / "temp"
+TRACKLISTS_DIR = (
+    Path.home() / "Music" / "Shazubak" / "tracklists"
+    if sys.platform == "darwin"
+    else APP_DIR / "tracklists"
+)
 
-PROGRAM_FILES_DIR.mkdir(exist_ok=True)
-TRACKLISTS_DIR.mkdir(exist_ok=True)
-TEMP_DIR.mkdir(exist_ok=True)
 
-FFMPEG = str(PROGRAM_FILES_DIR / "ffmpeg.exe")
-FFPROBE = str(PROGRAM_FILES_DIR / "ffprobe.exe")
-DENO = str(PROGRAM_FILES_DIR / "deno.exe")
+def tool_path(name):
+    executable = f"{name}.exe" if os.name == "nt" else name
+    folders = [PROGRAM_FILES_DIR]
+    if sys.platform == "darwin":
+        folders.insert(0, APP_DIR.parent / "Resources" / "bin")
+
+    for folder in folders:
+        bundled = folder / executable
+        if bundled.is_file() and os.access(bundled, os.X_OK):
+            return str(bundled)
+
+    path = shutil.which(name)
+    if path:
+        return path
+
+    if sys.platform == "darwin":
+        homebrew = Path("/opt/homebrew/bin") / name
+        if homebrew.is_file() and os.access(homebrew, os.X_OK):
+            return str(homebrew)
+
+    raise FileNotFoundError(f"{name} was not found in {PROGRAM_FILES_DIR} or PATH.")
 
 FIREFOX_PORTABLE_DIR = PROGRAM_FILES_DIR / "FirefoxPortable"
 FIREFOX_PORTABLE = str(FIREFOX_PORTABLE_DIR / "FirefoxPortable.exe")
 FIREFOX_PROFILE = FIREFOX_PORTABLE_DIR / "Data" / "profile"
-
-TEMP_SAMPLE = str(TEMP_DIR / "_shazam_sample.wav")
-DOWNLOAD_BASENAME = str(TEMP_DIR / "input_audio")
-
 
 # ============================================================
 # CONFIGURATION
@@ -102,12 +118,8 @@ def track_key(artist, title):
 # ============================================================
 
 def is_youtube_url(url):
-    url = url.lower()
-
-    return (
-        "youtube.com" in url
-        or "youtu.be" in url
-    )
+    host = urlsplit(url).hostname or ""
+    return host in {"youtube.com", "youtu.be"} or host.endswith(".youtube.com")
 
 
 def requires_youtube_auth(error):
@@ -257,180 +269,68 @@ def delete_firefox_credentials():
 # DOWNLOAD
 # ============================================================
 
-def download_audio(url):
+def download_with_options(url, options):
+    with YoutubeDL(options) as ydl:
+        info = ydl.extract_info(url, download=True)
+        return ydl.prepare_filename(info), info.get("title", "unknown")
 
+
+BROWSERS = ("Safari", "Chrome", "Firefox", "Edge", "Brave")
+
+
+def ask_browser():
+    return input(
+        "YouTube requires authentication. To use your browser session for "
+        f"this download, enter its name ({', '.join(BROWSERS)}), or press Enter to cancel: "
+    ).strip()
+
+
+def download_audio(url, temp_dir):
     options = {
         "format": "bestaudio/best",
-        "outtmpl": f"{DOWNLOAD_BASENAME}.%(ext)s",
+        "outtmpl": str(temp_dir / "input_audio.%(ext)s"),
         "noplaylist": True,
-        "quiet": False,
-
-        "js_runtimes": {
-            "deno": {
-                "path": DENO
-            }
-        },
-
-        "remote_components": {
-            "ejs:github"
-        },
+        "cachedir": False,
+        "ffmpeg_location": tool_path("ffmpeg"),
+        "js_runtimes": {"deno": {"path": tool_path("deno")}},
     }
 
-    print()
-    print(
-        "Downloading audio..."
-    )
-    print("-" * 70)
-
-    # --------------------------------------------------------
-    # FIRST ATTEMPT: NORMAL DOWNLOAD
-    # --------------------------------------------------------
-
+    print("\nDownloading audio...")
     try:
-
-        with YoutubeDL(options) as ydl:
-
-            info = ydl.extract_info(
-                url,
-                download=True
-            )
-
-            downloaded_file = (
-                ydl.prepare_filename(
-                    info
-                )
-            )
-
-            video_title = info.get(
-                "title",
-                "unknown"
-            )
-
-        return (
-            downloaded_file,
-            video_title
-        )
-
-    except DownloadError as e:
-
-        # If this is not YouTube, there is no reason
-        # to try YouTube authentication.
-        if not is_youtube_url(url):
+        return download_with_options(url, options)
+    except DownloadError as error:
+        if not is_youtube_url(url) or not requires_youtube_auth(error):
             raise
 
-        # Firefox Portable is only offered if the error
-        # actually appears to be authentication-related.
-        if not requires_youtube_auth(e):
+        if os.name != "nt":
+            browser = ask_browser().lower()
+            if browser not in {name.lower() for name in BROWSERS}:
+                raise
+
+            return download_with_options(
+                url, {**options, "cookiesfrombrowser": (browser,)}
+            )
+
+        answer = input("Sign in using Firefox Portable? [Y/n]: ").strip().lower()
+        if answer not in {"", "y", "yes"}:
             raise
-
-        print()
-
-        print(
-            "The normal download failed because this video "
-            "appears to require YouTube authentication."
-        )
-
-        answer = input(
-            "Would you like to sign in using "
-            "Firefox Portable? [Y/n]: "
-        ).strip().lower()
-
-        if answer not in (
-            "",
-            "y",
-            "yes"
-        ):
-
-            raise
-
-    # --------------------------------------------------------
-    # SECOND ATTEMPT: FIREFOX PORTABLE LOGIN
-    # --------------------------------------------------------
 
     if not open_firefox_for_login(url):
-
-        raise RuntimeError(
-            "Could not start Firefox Portable."
-        )
-
-    authenticated_options = dict(
-        options
-    )
-
-    authenticated_options[
-        "cookiesfrombrowser"
-    ] = (
-        "firefox",
-        str(FIREFOX_PROFILE),
-        None,
-        None
-    )
+        raise RuntimeError("Could not start Firefox Portable.")
 
     try:
-
-        print()
-
-        print(
-            "Reading the temporary Firefox session..."
+        return download_with_options(
+            url, {**options, "cookiesfrombrowser": ("firefox", str(FIREFOX_PROFILE))}
         )
-
-        print()
-
-        with YoutubeDL(
-            authenticated_options
-        ) as ydl:
-
-            info = ydl.extract_info(
-                url,
-                download=True
-            )
-
-            downloaded_file = (
-                ydl.prepare_filename(
-                    info
-                )
-            )
-
-            video_title = info.get(
-                "title",
-                "unknown"
-            )
-
-        print()
-
-        print(
-            "Authenticated download completed."
-        )
-
-        return (
-            downloaded_file,
-            video_title
-        )
-
     finally:
-
         delete_firefox_credentials()
 
 
-def find_downloaded_audio():
-
-    files = glob.glob(
-        str(
-            TEMP_DIR /
-            "input_audio.*"
-        )
-    )
-
-    valid_files = [
-        f for f in files
-        if not f.endswith(".part")
-        and not f.endswith(".ytdl")
-    ]
-
-    if not valid_files:
-        return None
-
-    return valid_files[0]
+def find_downloaded_audio(temp_dir):
+    for path in temp_dir.glob("input_audio.*"):
+        if not path.name.endswith((".part", ".ytdl")) and ".part-Frag" not in path.name:
+            return path
+    return None
 
 
 # ============================================================
@@ -440,7 +340,7 @@ def find_downloaded_audio():
 def get_duration(filename):
 
     command = [
-        FFPROBE,
+        tool_path("ffprobe"),
         "-v", "quiet",
         "-show_entries",
         "format=duration",
@@ -466,11 +366,12 @@ def get_duration(filename):
 
 def extract_sample(
     filename,
-    start_time
+    start_time,
+    sample_path
 ):
 
     command = [
-        FFMPEG,
+        tool_path("ffmpeg"),
         "-y",
         "-loglevel", "quiet",
         "-ss", str(start_time),
@@ -481,7 +382,7 @@ def extract_sample(
         "-vn",
         "-ac", "1",
         "-ar", "44100",
-        TEMP_SAMPLE
+        sample_path
     ]
 
     subprocess.run(
@@ -494,50 +395,22 @@ def extract_sample(
 # SHAZAM
 # ============================================================
 
-async def recognize_sample(
-    shazam,
-    audio_file,
-    start_time
-):
+async def recognize_sample(shazam, sample_path):
+    from shazamio_core import SignatureError
 
     try:
-
-        extract_sample(
-            audio_file,
-            start_time
-        )
-
-        result = await (
-            shazam.recognize(
-                TEMP_SAMPLE
-            )
-        )
-
-        track = result.get(
-            "track"
-        )
-
-        if not track:
-            return None
-
-        return {
-
-            "artist":
-                track.get(
-                    "subtitle",
-                    "Unknown artist"
-                ),
-
-            "title":
-                track.get(
-                    "title",
-                    "Unknown title"
-                )
-        }
-
-    except Exception:
-
+        result = await shazam.recognize(sample_path)
+    except SignatureError:
         return None
+
+    track = result.get("track")
+    if not track:
+        return None
+
+    return {
+        "artist": track.get("subtitle", "Unknown artist"),
+        "title": track.get("title", "Unknown title"),
+    }
 
 
 # ============================================================
@@ -545,7 +418,8 @@ async def recognize_sample(
 # ============================================================
 
 async def analyze_audio(
-    audio_file
+    audio_file,
+    sample_path,
 ):
 
     duration = get_duration(
@@ -567,84 +441,43 @@ async def analyze_audio(
 
     print()
 
-    shazam = Shazam()
+    if sys.platform == "darwin" and ssl.get_default_verify_paths().cafile is None:
+        os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+
+    from aiohttp import ClientConnectionError, ClientSSLError
+    from shazamio import Shazam
 
     detections = []
 
     current_time = 0
 
-    while (
-        current_time
-        < duration
-    ):
-
-        timestamp = format_time(
-            current_time
-        )
-
-        result = (
-            await recognize_sample(
-                shazam,
-                audio_file,
-                current_time
-            )
-        )
-
-        if result:
-
-            artist = (
-                result["artist"]
-            )
-
-            title = (
-                result["title"]
-            )
-
-            print(
-                f"{timestamp}  →  "
-                f"{artist} - {title}"
-            )
+    async with Shazam() as shazam:
+        while current_time < duration:
+            timestamp = format_time(current_time)
+            extract_sample(audio_file, current_time, sample_path)
+            result = None
+            for attempt in range(3):
+                try:
+                    result = await recognize_sample(shazam, sample_path)
+                except ClientSSLError:
+                    raise
+                except (ClientConnectionError, TimeoutError):
+                    if attempt == 2:
+                        print(f"{timestamp}  →  Skipped (Shazam connection failed)")
+                        break
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    if result:
+                        print(f"{timestamp}  →  {result['artist']} - {result['title']}")
+                    else:
+                        print(f"{timestamp}  →  Not identified")
+                    break
 
             detections.append({
-
-                "time":
-                    current_time,
-
-                "artist":
-                    artist,
-
-                "title":
-                    title
+                "time": current_time,
+                **(result or {"artist": None, "title": None}),
             })
-
-        else:
-
-            print(
-                f"{timestamp}  →  "
-                "Not identified"
-            )
-
-            detections.append({
-
-                "time":
-                    current_time,
-
-                "artist":
-                    None,
-
-                "title":
-                    None
-            })
-
-        current_time += INTERVAL
-
-    if os.path.exists(
-        TEMP_SAMPLE
-    ):
-
-        os.remove(
-            TEMP_SAMPLE
-        )
+            current_time += INTERVAL
 
     return detections
 
@@ -941,41 +774,6 @@ def print_tracklist(
 
 
 # ============================================================
-# CLEANUP
-# ============================================================
-
-def delete_downloaded_audio(
-    audio_file
-):
-
-    try:
-
-        if os.path.exists(
-            audio_file
-        ):
-
-            os.remove(
-                audio_file
-            )
-
-            print()
-
-            print(
-                "Temporary audio deleted: "
-                f"{audio_file}"
-            )
-
-    except Exception as e:
-
-        print()
-
-        print(
-            "Could not delete the "
-            f"temporary audio: {e}"
-        )
-
-
-# ============================================================
 # MAIN
 # ============================================================
 
@@ -1006,101 +804,36 @@ async def main():
         return
 
     try:
-
-        (
-            downloaded_file,
-            video_title
-        ) = download_audio(
-            url
-        )
-
-    except Exception as e:
-
-        print()
-
-        print(
-            "ERROR during download:"
-        )
-
-        print(e)
-
+        _, groups, filename = await run_analysis(url)
+    except Exception as error:
+        print(f"\nERROR: {error}")
         return
 
-    if not os.path.exists(
-        downloaded_file
-    ):
-
-        downloaded_file = (
-            find_downloaded_audio()
-        )
-
-    if downloaded_file is None:
-
-        print(
-            "Could not find the "
-            "downloaded file."
-        )
-
-        return
-
-    clean_title = (
-        sanitize_filename(
-            video_title
-        )
-    )
-
-    txt_filename = (
-        TRACKLISTS_DIR
-        /
-        f"tracklist_{clean_title}.txt"
-    )
-
-    print()
-
-    print(
-        f"Title: {video_title}"
-    )
-
-    detections = (
-        await analyze_audio(
-            downloaded_file
-        )
-    )
-
-    groups = (
-        summarize_detections(
-            detections
-        )
-    )
-
-    print_tracklist(
-        groups
-    )
-
-    save_tracklist_txt(
-        groups,
-        txt_filename
-    )
-
-    print()
-
-    print(
-        "Tracklist saved to:"
-    )
-
-    print(
-        f"  {txt_filename}"
-    )
-
-    delete_downloaded_audio(
-        downloaded_file
-    )
-
-    print()
-
-    print(
-        "Process finished."
-    )
+    print_tracklist(groups)
+    print(f"\nTracklist saved to:\n  {filename}")
 
 
-asyncio.run(main())
+async def run_analysis(url):
+    for name in ("ffmpeg", "ffprobe", "deno"):
+        tool_path(name)
+
+    with TemporaryDirectory(prefix="shazubak-") as directory:
+        temp_dir = Path(directory)
+        audio_file, title = download_audio(url, temp_dir)
+        if not Path(audio_file).is_file():
+            audio_file = find_downloaded_audio(temp_dir)
+        if audio_file is None:
+            raise FileNotFoundError("Could not find the downloaded audio.")
+
+        print(f"\nTitle: {title}")
+        detections = await analyze_audio(audio_file, str(temp_dir / "sample.wav"))
+
+    groups = summarize_detections(detections)
+    TRACKLISTS_DIR.mkdir(parents=True, exist_ok=True)
+    filename = TRACKLISTS_DIR / f"tracklist_{sanitize_filename(title)}.txt"
+    save_tracklist_txt(groups, filename)
+    return title, groups, filename
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

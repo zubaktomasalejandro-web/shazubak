@@ -1,6 +1,6 @@
 # shazubak
 
-A free Windows tool that scans long DJ sets from YouTube or SoundCloud, identifies tracks with Shazam, and generates a timestamped tracklist.
+A free command-line tool for Windows and macOS that scans long DJ sets from YouTube or SoundCloud, identifies tracks with Shazam, and generates a timestamped tracklist.
 
 ## Features
 
@@ -8,8 +8,7 @@ A free Windows tool that scans long DJ sets from YouTube or SoundCloud, identifi
 - YouTube and SoundCloud support
 - Timestamped tracklists
 - Low-confidence detections separated automatically
-- Portable Windows version
-- No installation required for the packaged release
+- Portable Windows release and self-contained macOS disk image
 - Optional temporary YouTube login for restricted videos
 - Temporary Firefox login data is deleted after the authenticated download attempt
 
@@ -27,7 +26,7 @@ These detections may still be correct, but may also correspond to samples, short
 
 ## Windows version
 
-Download the latest Windows ZIP from the Releases section.
+Download the Windows ZIP from [Shazubak 1.0.0](https://github.com/zubaktomasalejandro-web/shazubak/releases/tag/V1.0.0).
 
 Extract the ZIP and run:
 
@@ -35,13 +34,22 @@ Extract the ZIP and run:
 
 Do not move or delete the `program files` folder.
 
+## macOS version
+
+Download `Shazubak-macOS-arm64.dmg` from [GitHub Releases](https://github.com/zubaktomasalejandro-web/shazubak/releases).
+Mount the disk image, drag Shazubak to Applications, and open the app to paste a set link in Terminal.
+
+The disk image includes Python, FFmpeg, FFprobe, and Deno. It targets Apple Silicon and macOS 12 or later and was tested on macOS 26.6. The app uses an ad hoc signature and is not notarized, so Gatekeeper may block its first launch.
+
 ## Restricted YouTube videos
 
 Most videos work without authentication.
 
 If YouTube requires you to sign in, shazubak first lets the normal download process fail completely and then checks whether the error is actually authentication-related.
 
-Only in that case will it offer to open the included Firefox Portable instance.
+On macOS, enter the name of your browser to authorize use of its current session for that download. Press Enter to cancel. Shazubak does not export a cookie file.
+
+On Windows, Shazubak offers to open the included Firefox Portable instance.
 
 1. Log in to YouTube in Firefox Portable.
 2. Confirm that you can open the restricted video.
@@ -54,9 +62,7 @@ After the authenticated download attempt, the temporary Firefox profile is delet
 
 ## Output
 
-Tracklists are saved automatically inside:
-
-`tracklists/`
+On macOS, tracklists are saved in `~/Music/Shazubak/tracklists/`. On Windows, they go in `tracklists/` beside the executable.
 
 Example:
 
@@ -79,7 +85,7 @@ LOW RELIABILITY
 
 Requirements:
 
-- Python 3.12
+- Python 3.12 or 3.13
 - FFmpeg
 - FFprobe
 - Deno
@@ -90,7 +96,7 @@ Install the Python dependencies with:
 pip install -r requirements.txt
 ```
 
-The current Windows-oriented source expects the bundled executables in:
+On Windows, the portable executables go in:
 
 ```text
 program files/
@@ -100,10 +106,32 @@ program files/
 └── FirefoxPortable/
 ```
 
+## macOS Apple Silicon
+
+Build the command-line executable and the Finder app on an Apple Silicon Mac:
+
+```bash
+brew install ffmpeg deno
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+./build_mac.sh
+```
+
+Double-click `dist/Shazubak.app` in Finder to open Shazubak in Terminal. You can also run `./dist/shazubak` directly. The executable includes Python dependencies and looks for `ffmpeg`, `ffprobe` and `deno` on your PATH or in `/opt/homebrew/bin`.
+
+### Self-contained macOS disk image
+
+On an Apple Silicon Mac, install the Xcode Command Line Tools and the Python
+requirements above, then run `./build_dmg.sh`. It downloads and verifies the
+pinned FFmpeg source and Deno release, builds FFmpeg, and creates
+`dist/Shazubak-macOS-arm64.dmg`.
+
+Internet access is required to download media and recognize tracks.
+
 ## Building the Windows executable
 
 ```bash
-pyinstaller --onefile --name shazubak shazubak.py
+pyinstaller --onefile --collect-data yt_dlp_ejs --name shazubak shazubak.py
 ```
 
 The executable will be created inside:
